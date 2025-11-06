@@ -21,6 +21,10 @@ SUBTITLE_COPY=true                  # Whether to copy subtitle streams
 OUTPUT_SUFFIX="_out"               # Suffix appended to filenames before extension
 OUTPUT_DIR_NAME="completed_transcribing"  # Root folder for completed videos
 
+# Folders to exclude from scanning (besides OUTPUT_DIR_NAME which is always excluded)
+# Example: EXCLUDE_FOLDERS=("folder_to_skip" "folder2")
+EXCLUDE_FOLDERS=()
+
 # Progress and estimation
 SPEED_X_DEFAULT=1.35                 # Default speed factor (1.35x faster than real time)
 PROGRESS_BAR_WIDTH=40               # Width of progress bar
@@ -91,14 +95,18 @@ is_output_complete() {
   local tol=$((din/200)); [[ $tol -lt 1 ]] && tol=1
   (( dout < din - tol || dout > din + tol )) && return 1
 
-  local ain=$(probe_audio_stream_count "$input") aout=$(probe_audio_stream_count "$output")
-  [[ "$ain" -eq "$aout" ]] || return 1
+  # Only check audio streams if input has audio
+  local ain=$(probe_audio_stream_count "$input")
+  if [[ "$ain" -gt 0 ]]; then
+    local aout=$(probe_audio_stream_count "$output")
+    [[ "$ain" -eq "$aout" ]] || return 1
 
-  mapfile -t in_ch < <(probe_audio_channels_list "$input")
-  mapfile -t out_ch < <(probe_audio_channels_list "$output")
-  for i in "${!in_ch[@]}"; do
-    [[ "${out_ch[$i]}" == "${in_ch[$i]}" ]] || return 1
-  done
+    mapfile -t in_ch < <(probe_audio_channels_list "$input")
+    mapfile -t out_ch < <(probe_audio_channels_list "$output")
+    for i in "${!in_ch[@]}"; do
+      [[ "${out_ch[$i]}" == "${in_ch[$i]}" ]] || return 1
+    done
+  fi
 
   local mt_in=$(get_mtime "$input") mt_out=$(get_mtime "$output")
   [[ "$mt_in" == "$mt_out" ]] || return 1
@@ -119,6 +127,9 @@ fix_timestamps_and_metadata() {
 # ---- Info ----
 echo -e "\n${YELLOW}Transcoding videos under:${NOCOLOR} $CURRENT_DIR"
 echo -e "${YELLOW}Excluding:${NOCOLOR} $COMPLETED_ROOT"
+if [[ ${#EXCLUDE_FOLDERS[@]} -gt 0 ]]; then
+  echo -e "${YELLOW}Also excluding folders:${NOCOLOR} ${EXCLUDE_FOLDERS[*]}"
+fi
 echo -e "${YELLOW}Output:${NOCOLOR} $COMPLETED_ROOT (mirrors structure)"
 echo -e "${YELLOW}Codec:${NOCOLOR} $VIDEO_CODEC CRF $VIDEO_CRF | Audio $AUDIO_CODEC per-stream | Subs copied | ${YELLOW}Est. speed:${NOCOLOR} ${SPEED_X}x"
 echo -e "${RED}Existing *${OUTPUT_SUFFIX}.mp4 skipped if complete.${NOCOLOR}\n"
@@ -135,12 +146,16 @@ done
 # Coerce SPEED_X to a sane numeric default if empty
 if [[ -z "$SPEED_X" ]]; then SPEED_X=$SPEED_X_DEFAULT; fi
 
-# ---- Scan files (exclude completed_transcribing) ----
+# ---- Scan files (exclude completed_transcribing and EXCLUDE_FOLDERS) ----
 TOTAL_VIDEO_SIZE_ORIGINAL=0
 VIDEO_FILES=(); VIDEO_SIZES=(); VIDEO_DURATIONS=()
 
 echo -e "${BLUE}Scanning video files...${NOCOLOR}\n"
-find_cmd=( find "$CURRENT_DIR" -type d -name "$OUTPUT_DIR_NAME" -prune -o -type f \( -false )
+find_cmd=( find "$CURRENT_DIR" -type d \( -name "$OUTPUT_DIR_NAME" )
+for exclude_folder in "${EXCLUDE_FOLDERS[@]}"; do
+  find_cmd+=( -o -name "$exclude_folder" )
+done
+find_cmd+=( \) -prune -o -type f \( -false )
 for pat in "${EXTS[@]}"; do find_cmd+=( -o -iname "$pat" ); done
 find_cmd+=( \) -print0 )
 while IFS= read -r -d '' FILE; do
@@ -272,15 +287,31 @@ for idx in "${!VIDEO_FILES[@]}"; do
     ((a_idx++))
   done < <(probe_audio_channels_list "$input_file")
 
+  # Check if file has audio streams
+  has_audio=false
+  if [[ ${#audio_args[@]} -gt 0 ]]; then
+    has_audio=true
+  fi
+
   # Transcode
-  # Map video and audio streams, but exclude subtitles that aren't MP4-compatible
-  "$ffmpeg_bin" -y \
-    -i "$input_file" \
-    -map 0:v:0 -map 0:a -map_metadata 0 \
-    -c:v:0 "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
-    "${audio_args[@]}" \
-    -movflags +faststart \
-    "$output_file"
+  # Map video streams and optionally audio streams (if present)
+  if [[ "$has_audio" == true ]]; then
+    "$ffmpeg_bin" -y \
+      -i "$input_file" \
+      -map 0:v:0 -map 0:a -map_metadata 0 \
+      -c:v:0 "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
+      "${audio_args[@]}" \
+      -movflags +faststart \
+      "$output_file"
+  else
+    # No audio streams - only encode video
+    "$ffmpeg_bin" -y \
+      -i "$input_file" \
+      -map 0:v:0 -map_metadata 0 \
+      -c:v:0 "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
+      -movflags +faststart \
+      "$output_file"
+  fi
 
   # Add thumbnail as poster frame
   # Extract first frame as JPEG
