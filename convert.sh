@@ -111,8 +111,8 @@ is_output_complete() {
 
 fix_timestamps_and_metadata() {
   local input="$1" output="$2"
-  "$exiftool_bin" -api largefilesupport=1 -overwrite_original -TagsFromFile "$input" -All:All "$output" >/dev/null || true
-  "$exiftool_bin" -overwrite_original -api largefilesupport=1 -TagsFromFile "$input" "-FileCreateDate<FileCreateDate" "-FileModifyDate<FileModifyDate" "$output" >/dev/null || true
+  "$exiftool_bin" -ee -api largefilesupport=1 -overwrite_original -TagsFromFile "$input" -All:All "$output" >/dev/null || true
+  "$exiftool_bin" -ee -overwrite_original -api largefilesupport=1 -TagsFromFile "$input" "-FileCreateDate<FileCreateDate" "-FileModifyDate<FileModifyDate" "$output" >/dev/null || true
   touch -r "$input" "$output" || true
 }
 
@@ -273,14 +273,34 @@ for idx in "${!VIDEO_FILES[@]}"; do
   done < <(probe_audio_channels_list "$input_file")
 
   # Transcode
+  # Map video and audio streams, but exclude subtitles that aren't MP4-compatible
   "$ffmpeg_bin" -y \
     -i "$input_file" \
-    -map 0 -map_metadata 0 \
-    -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
+    -map 0:v:0 -map 0:a -map_metadata 0 \
+    -c:v:0 "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$VIDEO_CRF" \
     "${audio_args[@]}" \
-    -c:s copy \
     -movflags +faststart \
     "$output_file"
+
+  # Add thumbnail as poster frame
+  # Extract first frame as JPEG
+  temp_thumb="${output_file%.mp4}_thumb.jpg"
+  "$ffmpeg_bin" -y -i "$input_file" -vframes 1 -q:v 2 "$temp_thumb" >/dev/null 2>&1
+  
+  # Re-mux with thumbnail as attached pic
+  if [[ -f "$temp_thumb" ]]; then
+    temp_output="${output_file%.mp4}_temp.mp4"
+    "$ffmpeg_bin" -y -i "$output_file" -i "$temp_thumb" \
+      -map 0 -map 1 \
+      -c copy -disposition:v:1 attached_pic \
+      -movflags +faststart \
+      "$temp_output" >/dev/null 2>&1
+    
+    if [[ -f "$temp_output" && -s "$temp_output" ]]; then
+      mv "$temp_output" "$output_file"
+    fi
+    rm -f "$temp_thumb" "$temp_output"
+  fi
 
   # Metadata/timestamps
   fix_timestamps_and_metadata "$input_file" "$output_file"
