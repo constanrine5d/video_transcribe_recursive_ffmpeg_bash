@@ -26,7 +26,7 @@ OUTPUT_DIR_NAME="completed_transcribing"  # Root folder for completed videos
 EXCLUDE_FOLDERS=()
 
 # Progress and estimation
-SPEED_X_DEFAULT=1.35                 # Default speed factor (1.35x faster than real time)
+SPEED_X_DEFAULT=0.3                # Default speed factor (0.3x faster than real time)
 PROGRESS_BAR_WIDTH=40               # Width of progress bar
 
 
@@ -65,7 +65,10 @@ probe_duration() {
   [[ -n "$d" && "$d" != "N/A" ]] && printf "%.0f\n" "$d" || echo "0"
 }
 probe_audio_channels_list() { "$ffprobe_bin" -v error -select_streams a -show_entries stream=channels -of csv=p=0 "$1" 2>/dev/null || true; }
-probe_audio_stream_count() { probe_audio_channels_list "$1" | grep -c .; }
+probe_audio_stream_count() { 
+  local count=$(probe_audio_channels_list "$1" | grep -c . || echo "0")
+  echo "$count"
+}
 
 # ---- Time helpers for estimates ----
 fmt_hms() {
@@ -88,40 +91,51 @@ add_seconds_to_now() {
 # ---- Validation: output completeness ----
 is_output_complete() {
   local input="$1" output="$2"
-  [[ -s "$output" ]] || return 1
+  
+  # Check file exists and has content
+  [[ -s "$output" ]] || { echo "  [DEBUG] Output file missing or empty" >&2; return 1; }
 
+  # Check duration
   local din=$(probe_duration "$input") dout=$(probe_duration "$output")
-  (( din > 0 && dout > 0 )) || return 1
+  (( din > 0 && dout > 0 )) || { echo "  [DEBUG] Duration check failed: in=$din out=$dout" >&2; return 1; }
   local tol=$((din/200)); [[ $tol -lt 1 ]] && tol=1
-  (( dout < din - tol || dout > din + tol )) && return 1
+  (( dout < din - tol || dout > din + tol )) && { echo "  [DEBUG] Duration mismatch: in=$din out=$dout tol=$tol" >&2; return 1; }
 
   # Only check audio streams if input has audio
   local ain=$(probe_audio_stream_count "$input")
   if [[ "$ain" -gt 0 ]]; then
     local aout=$(probe_audio_stream_count "$output")
-    [[ "$ain" -eq "$aout" ]] || return 1
+    [[ "$ain" -eq "$aout" ]] || { echo "  [DEBUG] Audio stream count mismatch: in=$ain out=$aout" >&2; return 1; }
 
     mapfile -t in_ch < <(probe_audio_channels_list "$input")
     mapfile -t out_ch < <(probe_audio_channels_list "$output")
     for i in "${!in_ch[@]}"; do
-      [[ "${out_ch[$i]}" == "${in_ch[$i]}" ]] || return 1
+      [[ "${out_ch[$i]}" == "${in_ch[$i]}" ]] || { echo "  [DEBUG] Audio channel mismatch at stream $i: in=${in_ch[$i]} out=${out_ch[$i]}" >&2; return 1; }
     done
   fi
 
+  # Check modification time
   local mt_in=$(get_mtime "$input") mt_out=$(get_mtime "$output")
-  [[ "$mt_in" == "$mt_out" ]] || return 1
+  [[ "$mt_in" == "$mt_out" ]] || { echo "  [DEBUG] mtime mismatch: in=$mt_in out=$mt_out" >&2; return 1; }
 
+  # Check birth time if available
   local bt_in=$(get_birthtime "$input") bt_out=$(get_birthtime "$output")
-  if [[ -n "$bt_in" && -n "$bt_out" && "$bt_in" != "$bt_out" ]]; then return 1; fi
+  if [[ -n "$bt_in" && -n "$bt_out" && "$bt_in" != "$bt_out" ]]; then 
+    echo "  [DEBUG] birthtime mismatch: in=$bt_in out=$bt_out" >&2
+    return 1
+  fi
 
   return 0
 }
 
 fix_timestamps_and_metadata() {
   local input="$1" output="$2"
-  "$exiftool_bin" -ee -api largefilesupport=1 -overwrite_original -TagsFromFile "$input" -All:All "$output" >/dev/null || true
-  "$exiftool_bin" -ee -overwrite_original -api largefilesupport=1 -TagsFromFile "$input" "-FileCreateDate<FileCreateDate" "-FileModifyDate<FileModifyDate" "$output" >/dev/null || true
-  touch -r "$input" "$output" || true
+  # Copy all metadata from input to output
+  "$exiftool_bin" -ee -api largefilesupport=1 -overwrite_original -TagsFromFile "$input" -All:All "$output" >/dev/null 2>&1 || true
+  # Copy file timestamps from metadata
+  "$exiftool_bin" -ee -overwrite_original -api largefilesupport=1 -TagsFromFile "$input" "-FileCreateDate<FileCreateDate" "-FileModifyDate<FileModifyDate" "$output" >/dev/null 2>&1 || true
+  # Force filesystem timestamps to match input file
+  touch -r "$input" "$output" 2>/dev/null || true
 }
 
 # ---- Info ----
@@ -196,14 +210,32 @@ EST_HH=$((TOTAL_ESTIMATED_SECONDS/3600))
 EST_MM=$(((TOTAL_ESTIMATED_SECONDS%3600)/60))
 EST_SS=$((TOTAL_ESTIMATED_SECONDS%60))
 
-# ---- Print queue with estimates ----
+# ---- Print queue with estimates and skip status ----
 echo -e "${BLUE}Files found (with per-file ETA at ${SPEED_X}x):${NOCOLOR}\n"
 PER_FILE_EST_SECONDS=()
 TOTAL_EST_SECONDS=0
 CUMULATIVE_SECONDS=0
+SKIPPED_COUNT=0
 NOW_EPOCH=$(date +%s)
 for i in "${!VIDEO_FILES[@]}"; do
   FILE="${VIDEO_FILES[i]}"; SZ="${SORTED_VIDEO_SIZES[i]}"; DUR="${VIDEO_DURATIONS[i]}"
+  
+  # Check if output already exists and is complete
+  rel_path="${FILE#$CURRENT_DIR/}"
+  rel_dir="$(dirname "$rel_path")"
+  input_base="$(basename "$FILE")"
+  base_noext="${input_base%.*}"
+  dest_dir="$COMPLETED_ROOT/$rel_dir"
+  output_file="$dest_dir/${base_noext}${OUTPUT_SUFFIX}.mp4"
+  
+  WILL_SKIP=false
+  if [[ -e "$output_file" ]]; then
+    if is_output_complete "$FILE" "$output_file" 2>/dev/null; then
+      WILL_SKIP=true
+      ((SKIPPED_COUNT++))
+    fi
+  fi
+  
   # estimated seconds for this file at SPEED_X
   # guard against SPEED_X <= 0
   if awk "BEGIN{exit !($SPEED_X>0)}"; then
@@ -213,22 +245,28 @@ for i in "${!VIDEO_FILES[@]}"; do
   fi
   EST_INT=$(printf "%.0f" "$EST")
   PER_FILE_EST_SECONDS+=("$EST_INT")
-  TOTAL_EST_SECONDS=$((TOTAL_EST_SECONDS + EST_INT))
-
-  # Predicted finish time for this file considering cumulative time before it
-  CUMULATIVE_SECONDS=$((CUMULATIVE_SECONDS + EST_INT))
-  FINISH_TS=$(add_seconds_to_now "$CUMULATIVE_SECONDS")
-
-  printf "• %s\n    Size: %.2f GB | Duration: %s | Est: %s | Done by: %s\n" \
-    "$FILE" "$(echo "scale=2; $SZ / (1024^3)" | bc)" \
-    "$(fmt_hms "$DUR")" "$(fmt_hms "$EST_INT")" "$FINISH_TS"
+  
+  if [[ "$WILL_SKIP" == false ]]; then
+    TOTAL_EST_SECONDS=$((TOTAL_EST_SECONDS + EST_INT))
+    CUMULATIVE_SECONDS=$((CUMULATIVE_SECONDS + EST_INT))
+    FINISH_TS=$(add_seconds_to_now "$CUMULATIVE_SECONDS")
+    
+    printf "• %s\n    Size: %.2f GB | Duration: %s | Est: %s | Done by: %s\n" \
+      "$FILE" "$(echo "scale=2; $SZ / (1024^3)" | bc)" \
+      "$(fmt_hms "$DUR")" "$(fmt_hms "$EST_INT")" "$FINISH_TS"
+  else
+    printf "${GREEN}• [SKIP]${NOCOLOR} %s\n    Size: %.2f GB | Duration: %s | ${GREEN}Already transcoded${NOCOLOR}\n" \
+      "$FILE" "$(echo "scale=2; $SZ / (1024^3)" | bc)" \
+      "$(fmt_hms "$DUR")"
+  fi
 done
 
 
 # Print totals
 TOTAL_EST_HMS=$(fmt_hms "$TOTAL_EST_SECONDS")
 TOTAL_FINISH_TS=$(add_seconds_to_now "$TOTAL_EST_SECONDS")
-echo -e "\n${YELLOW}Total estimated processing time:${NOCOLOR} ${RED}${TOTAL_EST_HMS}${NOCOLOR}"
+echo -e "\n${YELLOW}Files to process:${NOCOLOR} $((${#VIDEO_FILES[@]} - SKIPPED_COUNT)) / ${#VIDEO_FILES[@]} ${GREEN}($SKIPPED_COUNT already complete)${NOCOLOR}"
+echo -e "${YELLOW}Total estimated processing time:${NOCOLOR} ${RED}${TOTAL_EST_HMS}${NOCOLOR}"
 echo -e "${YELLOW}Estimated batch completion time:${NOCOLOR} ${RED}${TOTAL_FINISH_TS}${NOCOLOR}\n"
 
 # Wait for explicit confirmation AFTER showing the queue and totals
@@ -333,8 +371,11 @@ for idx in "${!VIDEO_FILES[@]}"; do
     rm -f "$temp_thumb" "$temp_output"
   fi
 
-  # Metadata/timestamps
+  # Metadata/timestamps - must be done AFTER all file modifications
   fix_timestamps_and_metadata "$input_file" "$output_file"
+  
+  # Final timestamp sync - ensure filesystem timestamps match exactly
+  touch -r "$input_file" "$output_file" 2>/dev/null || true
 
   # Verify
   if is_output_complete "$input_file" "$output_file"; then
