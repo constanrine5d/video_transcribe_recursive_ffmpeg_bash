@@ -23,7 +23,7 @@ OUTPUT_DIR_NAME="completed_transcribing"  # Root folder for completed videos
 
 # Folders to exclude from scanning (besides OUTPUT_DIR_NAME which is always excluded)
 # Example: EXCLUDE_FOLDERS=("folder_to_skip" "folder2")
-EXCLUDE_FOLDERS=()
+EXCLUDE_FOLDERS=("agrafa")
 
 # Progress and estimation
 SPEED_X_DEFAULT=0.3                # Default speed factor (0.3x faster than real time)
